@@ -127,48 +127,144 @@ function getGeminiApiKey(): string {
   return apiKey.trim();
 }
 
+export class GeminiOverloadedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GeminiOverloadedError";
+  }
+}
+
+const DEFAULT_PRIMARY_MODEL = "gemini-3.1-flash-lite";
+const FALLBACK_MODEL = "gemini-3.8-flash";
+const TRANSIENT_RETRY_DELAY_MS = 600;
+
+function buildModelCandidates(): string[] {
+  const configured = process.env.GEMINI_MODEL?.trim();
+  const list = configured
+    ? [configured, DEFAULT_PRIMARY_MODEL, FALLBACK_MODEL]
+    : [DEFAULT_PRIMARY_MODEL, FALLBACK_MODEL];
+  return Array.from(new Set(list));
+}
+
+function getErrorStatus(error: unknown): number | undefined {
+  if (typeof error === "object" && error !== null && "status" in error) {
+    const status = (error as { status?: unknown }).status;
+    if (typeof status === "number") return status;
+  }
+  return undefined;
+}
+
+function isTransientOverloadError(error: unknown): boolean {
+  const status = getErrorStatus(error);
+  if (status === 503 || status === 429) return true;
+
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes('"code":503') ||
+    message.includes('"code":429') ||
+    message.includes("UNAVAILABLE") ||
+    message.includes("RESOURCE_EXHAUSTED") ||
+    message.toLowerCase().includes("high demand")
+  );
+}
+
+function isModelNotFoundError(error: unknown): boolean {
+  const status = getErrorStatus(error);
+  if (status === 404) return true;
+
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes('"code":404') || message.includes("NOT_FOUND");
+}
+
+function waitMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export async function parseShopRawText(
   rawText: string
 ): Promise<ParsedShopDraftDTO> {
   const apiKey = getGeminiApiKey();
   const useVertexAi = process.env.GEMINI_USE_VERTEXAI === "true";
-  const model = process.env.GEMINI_MODEL?.trim() || "gemini-3.8-flash";
   const ai = new GoogleGenAI(
     useVertexAi ? { vertexai: true, apiKey } : { apiKey }
   );
 
-  const response = await ai.models.generateContent({
-    model,
-    contents: rawText,
-    config: {
-      systemInstruction: SYSTEM_INSTRUCTION,
-      responseMimeType: "application/json",
-      responseSchema: shopParseResponseSchema,
-      temperature: 0.1,
-    },
-  });
+  const models = buildModelCandidates();
+  let lastError: unknown = null;
+  let sawOverload = false;
 
-  const responseText = response.text;
-  if (!responseText || responseText.trim().length === 0) {
-    throw new Error("Gemini returned an empty response.");
+  for (let i = 0; i < models.length; i += 1) {
+    const model = models[i];
+    if (!model) continue;
+
+    // Retry the primary model once on transient 503/429 before falling back
+    const maxAttempts = i === 0 ? 2 : 1;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents: rawText,
+          config: {
+            systemInstruction: SYSTEM_INSTRUCTION,
+            responseMimeType: "application/json",
+            responseSchema: shopParseResponseSchema,
+            temperature: 0.1,
+          },
+        });
+
+        const responseText = response.text;
+        if (!responseText || responseText.trim().length === 0) {
+          throw new Error("Gemini returned an empty response.");
+        }
+
+        let parsedJson: unknown;
+        try {
+          parsedJson = JSON.parse(responseText);
+        } catch {
+          throw new Error("Gemini returned malformed JSON.");
+        }
+
+        const validated = parsedShopDraftSchema.safeParse(parsedJson);
+        if (!validated.success) {
+          throw new Error("Gemini output failed schema validation.");
+        }
+
+        const urls = detectSourceUrls(rawText);
+
+        return {
+          ...validated.data,
+          ...urls,
+        };
+      } catch (error) {
+        lastError = error;
+
+        if (isTransientOverloadError(error)) {
+          sawOverload = true;
+          if (attempt < maxAttempts) {
+            await waitMs(TRANSIENT_RETRY_DELAY_MS);
+            continue;
+          }
+          break;
+        }
+
+        if (isModelNotFoundError(error)) {
+          break;
+        }
+
+        throw error;
+      }
+    }
   }
 
-  let parsedJson: unknown;
-  try {
-    parsedJson = JSON.parse(responseText);
-  } catch {
-    throw new Error("Gemini returned malformed JSON.");
+  if (sawOverload) {
+    const reason =
+      lastError instanceof Error ? lastError.message : "Gemini overloaded";
+    throw new GeminiOverloadedError(reason);
   }
 
-  const validated = parsedShopDraftSchema.safeParse(parsedJson);
-  if (!validated.success) {
-    throw new Error("Gemini output failed schema validation.");
+  if (lastError instanceof Error) {
+    throw lastError;
   }
-
-  const urls = detectSourceUrls(rawText);
-
-  return {
-    ...validated.data,
-    ...urls,
-  };
+  throw new Error("Gemini parse failed.");
 }

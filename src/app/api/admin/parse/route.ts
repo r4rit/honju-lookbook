@@ -5,11 +5,12 @@ import {
   parseJsonBody,
   unauthorizedResponse,
 } from "@/lib/api-response";
-import { parseShopRawText } from "@/lib/gemini";
+import { GeminiOverloadedError, parseShopRawText } from "@/lib/gemini";
 import { formatZodFieldErrors, parseRawTextSchema } from "@/lib/validators";
 
 export const preferredRegion = "icn1";
 export const dynamic = "force-dynamic";
+export const maxDuration = 30;
 
 export async function POST(request: Request) {
   if (!(await requireAdminSession())) {
@@ -45,6 +46,14 @@ export async function POST(request: Request) {
     }
 
     console.error("[api/admin/parse] Gemini parse failed:", message || error);
+
+    if (error instanceof GeminiOverloadedError) {
+      return jsonError(
+        503,
+        "AI_OVERLOADED",
+        "AI 서버가 일시적으로 혼잡해요. 잠시 후 다시 눌러 주세요."
+      );
+    }
 
     return jsonError(
       502,
